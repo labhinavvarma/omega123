@@ -10,13 +10,19 @@ from typing import List, Dict, Any, Optional, Sequence
 from mcp.client.sse import sse_client
 from mcp import ClientSession
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.prebuilt import create_react_agent
+# Updated import for LangChain agents
+try:
+    from langchain.agents import create_react_agent
+except ImportError:
+    # Fallback to old import if new one doesn't exist
+    from langgraph.prebuilt import create_react_agent
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage
 from langchain_core.outputs import ChatResult, ChatGeneration
 from langchain_core.tools import BaseTool
 from langchain_core.runnables import Runnable
+from pydantic import ConfigDict  # Import ConfigDict for Pydantic V2
 
 # Import configuration
 from config import config
@@ -37,17 +43,17 @@ show_server_info = st.sidebar.checkbox("🛡 Show MCP Server Info", value=False)
 class ChatSnowflakeCortexAPI(BaseChatModel):
     """Custom LangChain wrapper for Snowflake Cortex API via SF Assist"""
     
-    session_id: str = None
+    session_id: Optional[str] = None
     model_name: str = config.model
     bound_tools: List[Any] = []
+    
+    # Pydantic V2 configuration using ConfigDict
+    model_config = ConfigDict(arbitrary_types_allowed=True)
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         if self.session_id is None:
             self.session_id = str(uuid.uuid4())
-    
-    class Config:
-        arbitrary_types_allowed = True
     
     def bind_tools(
         self,
@@ -94,7 +100,7 @@ class ChatSnowflakeCortexAPI(BaseChatModel):
     def _generate(
         self,
         messages: List[BaseMessage],
-        stop: List[str] | None = None,
+        stop: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> ChatResult:
         """Synchronous generation - converts messages and calls SF Assist API"""
@@ -159,7 +165,7 @@ class ChatSnowflakeCortexAPI(BaseChatModel):
     async def _agenerate(
         self,
         messages: List[BaseMessage],
-        stop: List[str] | None = None,
+        stop: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> ChatResult:
         """Async generation"""
@@ -343,7 +349,7 @@ else:
                 # Get model
                 model = get_model()
                 
-                # Create agent
+                # Create agent - using updated import
                 agent = create_react_agent(model=model, tools=tools)
                 
                 # Get prompt from server if available
