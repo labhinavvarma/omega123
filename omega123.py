@@ -8,6 +8,7 @@ from mcp import ClientSession
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt import create_react_agent
 from llmobject_wrapper import ChatSnowflakeCortex
+from sfassist_session import SFAssistMockSession  # Import mock session
 
 # Page config
 st.set_page_config(page_title="Healthcare AI Chat", page_icon="🏥")
@@ -102,13 +103,17 @@ if show_server_info:
         for p in mcp_data["prompts"]:
             st.markdown(f"**{p['name']}**")
 else:
-    # Chat functionality - NO Snowflake connection needed for SF Assist
+    # Chat functionality with SF Assist via Mock Session
     @st.cache_resource
     def get_model():
-        # Create model WITHOUT Snowflake session
+        # Create mock SF Assist session
+        mock_session = SFAssistMockSession()
+        
+        # Create model with mock session
         return ChatSnowflakeCortex(
             model="llama3.1-70b",
-            cortex_function="complete"
+            cortex_function="complete",
+            session=mock_session  # Use mock session!
         )
     
     prompt_type = st.sidebar.radio("Select Prompt Type", ["Calculator", "HEDIS Expert", "Weather", "No Context"])
@@ -187,11 +192,11 @@ else:
                 prompt_name = prompt_map[prompt_type]
                 
                 if prompt_name:
-                    # FIXED: Pass query as argument to get_prompt
+                    # Pass query as argument to get_prompt
                     prompt_from_server = await client.get_prompt(
                         server_name="DataFlyWheelServer",
                         prompt_name=prompt_name,
-                        arguments={"query": query_text}  # Pass query as required argument
+                        arguments={"query": query_text}
                     )
                     
                     # The prompt should already be formatted with the query
