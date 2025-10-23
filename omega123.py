@@ -1,387 +1,311 @@
-import streamlit as st
-import asyncio
 import json
-import yaml
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Type,
+    Union,
+)
 import requests
 import uuid
 import urllib3
-from typing import List, Dict, Any, Optional, Sequence
 
-from mcp.client.sse import sse_client
-from mcp import ClientSession
-from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.prebuilt import create_react_agent
-
+from langchain_core.callbacks.manager import CallbackManagerForLLMRun
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage
-from langchain_core.outputs import ChatResult, ChatGeneration
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    ChatMessage,
+    HumanMessage,
+    SystemMessage,
+)
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.tools import BaseTool
-from langchain_core.runnables import Runnable
-from pydantic import ConfigDict
+from langchain_core.utils import (
+    convert_to_secret_str,
+    get_from_dict_or_env,
+    get_pydantic_field_names,
+)
+from langchain_core.utils.function_calling import convert_to_openai_tool
+from langchain_core.utils.utils import _build_model_kwargs
+from pydantic import Field, SecretStr, model_validator
 
-# Import configuration
-from config import config
+# Disable SSL warnings for internal/dev environments
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Disable SSL warnings if configured
-if not config.verify_ssl:
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# === SF Assist API Configuration ===
+API_URL = "https://sfassist.edagenaidev.awsdns.internal.das/api/cortex/complete"
+API_KEY = "78a799ea-a0f6-11ef-a0ce-15a449f7a8b0"
+APP_ID = "edadip"
+APLCTN_CD = "edagnai"
+SYS_MSG = "You are a powerful AI assistant. Provide accurate, concise answers based on context."
 
-# Page config
-st.set_page_config(page_title=config.app_title, page_icon=config.app_icon)
-st.title(config.app_title)
+SUPPORTED_ROLES: List[str] = [
+    "system",
+    "user",
+    "assistant",
+]
 
-server_url = st.sidebar.text_input("MCP Server URL", config.mcp_default_url)
-show_server_info = st.sidebar.checkbox("🛡 Show MCP Server Info", value=False)
+import re
 
 
-# === Custom SF Assist LLM Wrapper ===
-class ChatSnowflakeCortexAPI(BaseChatModel):
-    """Custom LangChain wrapper for Snowflake Cortex API via SF Assist"""
-    
-    session_id: Optional[str] = None
-    model_name: str = config.model
-    bound_tools: List[Any] = []
-    
-    # Pydantic V2 configuration
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-    
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        if self.session_id is None:
-            self.session_id = str(uuid.uuid4())
-    
+class ChatSnowflakeCortexError(Exception):
+    """Error with Snowpark client."""
+
+
+def _convert_message_to_dict(message: BaseMessage) -> dict:
+    """Convert a LangChain message to a dictionary.
+
+    Args:
+        message: The LangChain message.
+
+    Returns:
+        The dictionary.
+    """
+    message_dict: Dict[str, Any] = {
+        "content": message.content,
+    }
+
+    # Populate role and additional message data
+    if isinstance(message, ChatMessage) and message.role in SUPPORTED_ROLES:
+        message_dict["role"] = message.role
+    elif isinstance(message, SystemMessage):
+        message_dict["role"] = "system"
+    elif isinstance(message, HumanMessage):
+        message_dict["role"] = "user"
+    elif isinstance(message, AIMessage):
+        message_dict["role"] = "assistant"
+    else:
+        raise TypeError(f"Got unknown type {message}")
+    return message_dict
+
+
+def _truncate_at_stop_tokens(
+    text: str,
+    stop: Optional[List[str]],
+) -> str:
+    """Truncates text at the earliest stop token found."""
+    if stop is None:
+        return text
+
+    for stop_token in stop:
+        stop_token_idx = text.find(stop_token)
+        if stop_token_idx != -1:
+            text = text[:stop_token_idx]
+    return text
+
+
+class ChatSnowflakeCortex(BaseChatModel):
+    """Snowflake Cortex based Chat model - Modified to use SF Assist API
+
+    To use the chat model, you must have the ``snowflake-snowpark-python`` Python
+    package installed and either:
+
+        1. environment variables set with your snowflake credentials or
+        2. directly passed in as kwargs to the ChatSnowflakeCortex constructor.
+
+    Example:
+        .. code-block:: python
+
+            from llmobject_wrapper import ChatSnowflakeCortex
+            chat = ChatSnowflakeCortex()
+    """
+
+    test_tools: Dict[str, Union[Dict[str, Any], Type, Callable, BaseTool]] = Field(
+        default_factory=dict
+    )
+
+    session: Any = None
+    """Snowpark session object (kept for compatibility but not used with SF Assist)."""
+
+    model: str = "llama3.1-70b"
+    """Model name for SF Assist API."""
+
+    cortex_function: str = "complete"
+    """Cortex function to use, defaulted to `complete`."""
+
+    temperature: float = 0
+    """Model temperature. Value should be >= 0 and <= 1.0"""
+
+    max_tokens: Optional[int] = None
+    """The maximum number of output tokens in the response."""
+
+    top_p: Optional[float] = 0
+    """top_p adjusts the number of choices for each predicted tokens based on
+        cumulative probabilities. Value should be ranging between 0.0 and 1.0.
+    """
+
+    # Keep these for compatibility but they're not used with SF Assist
+    snowflake_username: Optional[str] = Field(default=None, alias="username")
+    snowflake_password: Optional[SecretStr] = Field(default=None, alias="password")
+    snowflake_account: Optional[str] = Field(default=None, alias="account")
+    snowflake_database: Optional[str] = Field(default=None, alias="database")
+    snowflake_schema: Optional[str] = Field(default=None, alias="schema")
+    snowflake_warehouse: Optional[str] = Field(default=None, alias="warehouse")
+    snowflake_role: Optional[str] = Field(default=None, alias="role")
+
+    # SF Assist session ID
+    sf_assist_session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+
     def bind_tools(
         self,
-        tools: Sequence[BaseTool | dict],
+        tools: Sequence[Union[Dict[str, Any], Type, Callable, BaseTool]],
+        *,
+        tool_choice: Optional[
+            Union[dict, str, Literal["auto", "any", "none"], bool]
+        ] = "auto",
         **kwargs: Any,
-    ) -> "ChatSnowflakeCortexAPI":  # Return self, not new instance
-        """Bind tools to the model - required for ReAct agent"""
-        # Update the existing instance instead of creating new one
-        self.bound_tools = list(tools)
+    ) -> "ChatSnowflakeCortex":
+        """Bind tool-like objects to this chat model, ensuring they conform to
+        expected formats."""
+
+        formatted_tools = [convert_to_openai_tool(tool) for tool in tools]
+        formatted_tools_dict = {
+            tool["name"]: tool for tool in formatted_tools if "name" in tool
+        }
+        self.test_tools.update(formatted_tools_dict)
+
+        print("Tools bound to chat model:")
+        print(formatted_tools)
+        print(formatted_tools_dict)
+        print(self.test_tools)
+        print("########################################")
         return self
-    
-    def _format_messages_with_tools(self, messages: List[BaseMessage]) -> List[Dict]:
-        """Convert LangChain messages to API format, including tool information"""
-        api_messages = []
-        
-        # Add system message with tool information if tools are bound
-        if self.bound_tools:
-            tool_descriptions = []
-            for tool in self.bound_tools:
-                if hasattr(tool, 'name') and hasattr(tool, 'description'):
-                    tool_descriptions.append(f"- {tool.name}: {tool.description}")
-            
-            if tool_descriptions:
-                tools_text = "\n".join(tool_descriptions)
-                system_content = f"{config.sys_msg}\n\nYou have access to the following tools:\n{tools_text}\n\nTo use a tool, respond with a tool call in your reasoning."
-                api_messages.append({"role": "system", "content": system_content})
-        
-        # Convert messages
-        for msg in messages:
-            if isinstance(msg, HumanMessage):
-                api_messages.append({"role": "user", "content": msg.content})
-            elif isinstance(msg, AIMessage):
-                api_messages.append({"role": "assistant", "content": msg.content})
-            elif isinstance(msg, SystemMessage):
-                if not any(m.get("role") == "system" for m in api_messages):
-                    api_messages.append({"role": "system", "content": msg.content})
-            else:
-                api_messages.append({"role": "user", "content": str(msg.content)})
-        
-        return api_messages
-    
+
+    @model_validator(mode="before")
+    @classmethod
+    def build_extra(cls, values: Dict[str, Any]) -> Any:
+        """Build extra kwargs from additional params that were passed in."""
+        all_required_field_names = get_pydantic_field_names(cls)
+        values = _build_model_kwargs(values, all_required_field_names)
+        return values
+
+    def __del__(self) -> None:
+        if getattr(self, "session", None) is not None:
+            self.session.close()
+
+    @property
+    def _llm_type(self) -> str:
+        """Get the type of language model used by this chat model."""
+        return f"snowflake-cortex-{self.model}-sfassist"
+
     def _generate(
         self,
         messages: List[BaseMessage],
         stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> ChatResult:
-        """Synchronous generation - converts messages and calls SF Assist API"""
+        """Generate response using SF Assist API instead of Snowflake Cortex"""
         
-        # Format messages with tool information
-        api_messages = self._format_messages_with_tools(messages)
-        
-        # Build payload
+        # Convert messages to API format
+        message_dicts = [_convert_message_to_dict(m) for m in messages]
+
+        # Add tool information to system message if tools are bound
+        if self.test_tools:
+            tool_descriptions = []
+            for tool_name, tool_def in self.test_tools.items():
+                if isinstance(tool_def, dict):
+                    description = tool_def.get('description', '')
+                    tool_descriptions.append(f"- {tool_name}: {description}")
+            
+            if tool_descriptions:
+                tools_text = "\n".join(tool_descriptions)
+                system_msg = f"{SYS_MSG}\n\nYou have access to the following tools:\n{tools_text}"
+                # Add or update system message
+                has_system = any(m.get("role") == "system" for m in message_dicts)
+                if not has_system:
+                    message_dicts.insert(0, {"role": "system", "content": system_msg})
+
+        # Build SF Assist API payload
         payload = {
             "query": {
-                "aplctn_cd": config.aplctn_cd,
-                "app_id": config.app_id,
-                "api_key": config.api_key,
+                "aplctn_cd": APLCTN_CD,
+                "app_id": APP_ID,
+                "api_key": API_KEY,
                 "method": "cortex",
-                "model": self.model_name,
-                "sys_msg": config.sys_msg,
+                "model": self.model,
+                "sys_msg": SYS_MSG,
                 "limit_convs": "0",
                 "prompt": {
-                    "messages": api_messages
+                    "messages": message_dicts
                 },
                 "app_lvl_prefix": "",
                 "user_id": "",
-                "session_id": self.session_id
+                "session_id": self.sf_assist_session_id
             }
         }
-        
+
         headers = {
             "Content-Type": "application/json; charset=utf-8",
             "Accept": "application/json",
-            "Authorization": f'Snowflake Token="{config.api_key}"'
+            "Authorization": f'Snowflake Token="{API_KEY}"'
         }
-        
+
         try:
-            response = requests.post(
-                config.api_url, 
-                headers=headers, 
-                json=payload, 
-                verify=config.verify_ssl
-            )
-            
+            # Call SF Assist API
+            response = requests.post(API_URL, headers=headers, json=payload, verify=False)
+
             if response.status_code == 200:
                 raw = response.text
                 
                 # Parse response
                 if "end_of_stream" in raw:
                     answer, _, _ = raw.partition("end_of_stream")
-                    bot_reply = answer.strip()
+                    ai_message_content = answer.strip()
                 else:
-                    bot_reply = raw.strip()
-                
-                # Return as LangChain ChatResult
-                message = AIMessage(content=bot_reply)
+                    ai_message_content = raw.strip()
+
+                content = _truncate_at_stop_tokens(ai_message_content, stop)
+                message = AIMessage(
+                    content=content,
+                    response_metadata={"model": self.model, "session_id": self.sf_assist_session_id},
+                )
                 generation = ChatGeneration(message=message)
                 return ChatResult(generations=[generation])
-            
             else:
-                raise Exception(f"API Error {response.status_code}: {response.text}")
-                
+                raise ChatSnowflakeCortexError(
+                    f"SF Assist API Error {response.status_code}: {response.text}"
+                )
+
         except Exception as e:
-            raise Exception(f"Request failed: {str(e)}")
-    
-    async def _agenerate(
+            raise ChatSnowflakeCortexError(
+                f"Error while making request to SF Assist API: {e}"
+            )
+
+    def _stream_content(
+        self, content: str, stop: Optional[List[str]]
+    ) -> Iterator[ChatGenerationChunk]:
+        """
+        Stream the output of the model in chunks to return ChatGenerationChunk.
+        """
+        chunk_size = 50  # Define a reasonable chunk size for streaming
+        truncated_content = _truncate_at_stop_tokens(content, stop)
+
+        for i in range(0, len(truncated_content), chunk_size):
+            chunk_content = truncated_content[i : i + chunk_size]
+
+            # Create and yield a ChatGenerationChunk with partial content
+            yield ChatGenerationChunk(message=AIMessageChunk(content=chunk_content))
+
+    def _stream(
         self,
         messages: List[BaseMessage],
         stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
-    ) -> ChatResult:
-        """Async generation"""
-        return self._generate(messages, stop, **kwargs)
-    
-    @property
-    def _llm_type(self) -> str:
-        """Return identifier for this LLM"""
-        return "snowflake_cortex_api"
-    
-    @property
-    def _identifying_params(self) -> Dict[str, Any]:
-        """Return identifying parameters"""
-        return {
-            "model_name": self.model_name,
-            "session_id": self.session_id,
-        }
-
-
-# === Server Info ===
-if show_server_info:
-    async def fetch_mcp_info():
-        result = {"resources": [], "tools": [], "prompts": [], "yaml": [], "search": []}
-        try:
-            async with sse_client(url=server_url) as sse_connection:
-                async with ClientSession(*sse_connection) as session:
-                    await session.initialize()
- 
-                    # --- Resources ---
-                    resources = await session.list_resources()
-                    if hasattr(resources, 'resources'):
-                        for r in resources.resources:
-                            result["resources"].append({"name": r.name})
-                   
-                    # --- Tools (filtered) ---
-                    tools = await session.list_tools()
-                    hidden_tools = {"add-frequent-questions", "add-prompts", "suggested_top_prompts"}
-                    if hasattr(tools, 'tools'):
-                        for t in tools.tools:
-                            if t.name not in hidden_tools:
-                                result["tools"].append({"name": t.name})
- 
-                    # --- Prompts ---
-                    prompts = await session.list_prompts()
-                    if hasattr(prompts, 'prompts'):
-                        for p in prompts.prompts:
-                            args = []
-                            if hasattr(p, 'arguments'):
-                                for arg in p.arguments:
-                                    args.append(f"{arg.name} ({'Required' if arg.required else 'Optional'}): {arg.description}")
-                            result["prompts"].append({
-                                "name": p.name,
-                                "description": getattr(p, 'description', ''),
-                                "args": args
-                            })
- 
-                    # --- YAML Resources ---
-                    try:
-                        yaml_content = await session.read_resource("schematiclayer://cortex_analyst/schematic_models/hedis_stage_full/list")
-                        if hasattr(yaml_content, 'contents'):
-                            for item in yaml_content.contents:
-                                if hasattr(item, 'text'):
-                                    parsed = yaml.safe_load(item.text)
-                                    result["yaml"].append(yaml.dump(parsed, sort_keys=False))
-                    except Exception as e:
-                        result["yaml"].append(f"YAML error: {e}")
- 
-                    # --- Search Objects ---
-                    try:
-                        content = await session.read_resource("search://cortex_search/search_obj/list")
-                        if hasattr(content, 'contents'):
-                            for item in content.contents:
-                                if hasattr(item, 'text'):
-                                    objs = json.loads(item.text)
-                                    result["search"].extend(objs)
-                    except Exception as e:
-                        result["search"].append(f"Search error: {e}")
- 
-        except Exception as e:
-            st.sidebar.error(f"❌ MCP Connection Error: {e}")
-        return result
- 
-    mcp_data = asyncio.run(fetch_mcp_info())
- 
-    # Display Resources
-    with st.sidebar.expander("📦 Resources", expanded=False):
-        for r in mcp_data["resources"]:
-            if "cortex_search/search_obj/list" in r["name"]:
-                display_name = "Cortex Search"
-            else:
-                display_name = r["name"]
-            st.markdown(f"**{display_name}**")
-    
-    # --- YAML Section ---
-    with st.sidebar.expander("Schematic Layer", expanded=False):
-        for y in mcp_data["yaml"]:
-            st.code(y, language="yaml")
- 
-    # --- Tools Section (Filtered) ---
-    with st.sidebar.expander("🛠 Tools", expanded=False):
-        for t in mcp_data["tools"]:
-            st.markdown(f"**{t['name']}**")
- 
-    # Display Prompts
-    with st.sidebar.expander("🧐 Prompts", expanded=False):
-        for p in mcp_data["prompts"]:
-            st.markdown(f"**{p['name']}**")
-else:
-    # Chat functionality with SF Assist
-    @st.cache_resource
-    def get_model():
-        """Get SF Assist LLM model"""
-        return ChatSnowflakeCortexAPI(model_name=config.model)
-    
-    prompt_type = st.sidebar.radio("Select Prompt Type", ["Calculator", "HEDIS Expert", "Weather", "No Context"])
-    prompt_map = {
-        "Calculator": "calculator-prompt",
-        "HEDIS Expert": "hedis-prompt",
-        "Weather": "weather-prompt",
-        "No Context": None
-    }
- 
-    examples = {
-        "Calculator": ["(4+5)/2.0", "sqrt(16) + 7", "3^4 - 12"],
-        "HEDIS Expert": [],
-        "Weather": [
-            "What is the present weather in Richmond?",
-            "What's the weather forecast for Atlanta?",
-            "Is it raining in New York City today?"
-        ],
-        "No Context": ["Who won the world cup in 2022?", "Summarize climate change impact on oceans"]
-    }
- 
-    if prompt_type == "HEDIS Expert":
-        try:
-            async def fetch_hedis_examples():
-                async with sse_client(url=server_url) as sse_connection:
-                    async with ClientSession(*sse_connection) as session:
-                        await session.initialize()
-                        content = await session.read_resource("genaiplatform://hedis/frequent_questions/Initialization")
-                        if hasattr(content, "contents"):
-                            for item in content.contents:
-                                if hasattr(item, "text"):
-                                    examples["HEDIS Expert"].extend(json.loads(item.text))
-   
-            asyncio.run(fetch_hedis_examples())
-        except Exception as e:
-            examples["HEDIS Expert"] = [f"⚠️ Failed to load examples: {e}"]
- 
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
- 
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.write(message["content"])
- 
-    with st.sidebar.expander("Example Queries", expanded=True):
-        for example in examples[prompt_type]:
-            if st.button(example, key=example):
-                st.session_state.query_input = example
- 
-    query = st.chat_input("Type your query here...")
-    if "query_input" in st.session_state:
-        query = st.session_state.query_input
-        del st.session_state.query_input
- 
-    async def process_query(query_text):
-        st.session_state.messages.append({"role": "user", "content": query_text})
-        with st.chat_message("assistant"):
-            message_placeholder = st.empty()
-            message_placeholder.text("Processing...")
-            try:
-                # Initialize MCP client
-                client = MultiServerMCPClient(
-                    {config.mcp_server_name: {"url": server_url, "transport": config.mcp_transport}}
-                )
-                
-                # Get tools - MUST be awaited
-                tools = await client.get_tools()
-                
-                # Get model
-                model = get_model()
-                
-                # Create agent
-                agent = create_react_agent(model=model, tools=tools)
-                
-                # Get prompt with empty arguments like original
-                prompt_name = prompt_map[prompt_type]
-                
-                if prompt_name:
-                    prompt_from_server = await client.get_prompt(
-                        server_name=config.mcp_server_name,
-                        prompt_name=prompt_name,
-                        arguments={}  # Empty like original
-                    )
-                    
-                    # Handle {query} placeholder like original
-                    if "{query}" in prompt_from_server[0].content:
-                        formatted_prompt = prompt_from_server[0].content.format(query=query_text)
-                    else:
-                        formatted_prompt = prompt_from_server[0].content + query_text
-                else:
-                    formatted_prompt = query_text
-                
-                # Invoke agent
-                response = await agent.ainvoke({"messages": formatted_prompt})
-                result = list(response.values())[0][1].content
-                message_placeholder.text(result)
-                st.session_state.messages.append({"role": "assistant", "content": result})
-                
-            except Exception as e:
-                error_message = f"Error: {str(e)}"
-                message_placeholder.text(error_message)
-                st.session_state.messages.append({"role": "assistant", "content": error_message})
-                import traceback
-                print(f"Full error:\n{traceback.format_exc()}")
- 
-    if query:
-        asyncio.run(process_query(query))
- 
-    if st.sidebar.button("Clear Chat"):
-        st.session_state.messages = []
-        st.rerun()
- 
-    st.sidebar.markdown("---")
-    st.sidebar.markdown(f"{config.app_title} v{config.app_version} (SF Assist)")
+    ) -> Iterator[ChatGenerationChunk]:
+        """Stream the output of the model in chunks to return ChatGenerationChunk."""
+        
+        # Use the same _generate method and stream its output
+        result = self._generate(messages, stop, run_manager, **kwargs)
+        content = result.generations[0].message.content
+        
+        for chunk in self._stream_content(content, stop):
+            yield chunk
