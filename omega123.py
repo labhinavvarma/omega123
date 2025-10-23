@@ -10,19 +10,14 @@ from typing import List, Dict, Any, Optional, Sequence
 from mcp.client.sse import sse_client
 from mcp import ClientSession
 from langchain_mcp_adapters.client import MultiServerMCPClient
-# Updated import for LangChain agents
-try:
-    from langchain.agents import create_react_agent
-except ImportError:
-    # Fallback to old import if new one doesn't exist
-    from langgraph.prebuilt import create_react_agent
+from langgraph.prebuilt import create_react_agent  # Keep original import
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage
 from langchain_core.outputs import ChatResult, ChatGeneration
 from langchain_core.tools import BaseTool
 from langchain_core.runnables import Runnable
-from pydantic import ConfigDict  # Import ConfigDict for Pydantic V2
+from pydantic import ConfigDict
 
 # Import configuration
 from config import config
@@ -47,7 +42,7 @@ class ChatSnowflakeCortexAPI(BaseChatModel):
     model_name: str = config.model
     bound_tools: List[Any] = []
     
-    # Pydantic V2 configuration using ConfigDict
+    # Pydantic V2 configuration
     model_config = ConfigDict(arbitrary_types_allowed=True)
     
     def __init__(self, **kwargs):
@@ -108,7 +103,7 @@ class ChatSnowflakeCortexAPI(BaseChatModel):
         # Format messages with tool information
         api_messages = self._format_messages_with_tools(messages)
         
-        # Build payload using config
+        # Build payload
         payload = {
             "query": {
                 "aplctn_cd": config.aplctn_cd,
@@ -338,28 +333,30 @@ else:
             message_placeholder = st.empty()
             message_placeholder.text("Processing...")
             try:
-                # Initialize MCP client WITHOUT context manager
+                # Use context manager like original (even though deprecated)
                 client = MultiServerMCPClient(
                     {config.mcp_server_name: {"url": server_url, "transport": config.mcp_transport}}
                 )
                 
-                # Get tools from client
-                tools = await client.get_tools()
-                
-                # Get model
                 model = get_model()
                 
-                # Create agent - using updated import
+                # Get tools SYNCHRONOUSLY like original
+                tools = client.get_tools()
+                
+                # Create agent
                 agent = create_react_agent(model=model, tools=tools)
                 
-                # Get prompt from server if available
+                # Get prompt with empty arguments like original
                 prompt_name = prompt_map[prompt_type]
+                
                 if prompt_name:
                     prompt_from_server = await client.get_prompt(
                         server_name=config.mcp_server_name,
                         prompt_name=prompt_name,
-                        arguments={}
+                        arguments={}  # Empty like original
                     )
+                    
+                    # Handle {query} placeholder like original
                     if "{query}" in prompt_from_server[0].content:
                         formatted_prompt = prompt_from_server[0].content.format(query=query_text)
                     else:
